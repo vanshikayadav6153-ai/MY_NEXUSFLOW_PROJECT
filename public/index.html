@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NexusFlow // Advanced PC-Mobile Pipeline Controller</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Inter:wght@300;400;500;600;700&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+  <!-- Animated Particle Network Background -->
+  <canvas id="particle-canvas"></canvas>
+
+  <!-- Background Cyber Grid -->
+  <div class="cyber-grid"></div>
+  <div class="scanlines"></div>
+
+  <!-- Toast Notification Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- Main HUD Layout -->
+  <div class="hud-container">
+    
+    <!-- Top Header Bar -->
+    <header class="hud-header">
+      <div class="header-logo">
+        <span class="logo-accent">⚡</span>
+        <h1>NEXUSFLOW <span class="version">v2.0.0</span></h1>
+      </div>
+      <div class="header-status">
+        <div class="status-indicator">
+          <span class="status-dot disconnected" id="adb-status-dot"></span>
+          <span class="status-text" id="adb-status-text">ADB DISCONNECTED</span>
+        </div>
+        <div class="status-details">
+          <span id="header-device-model">NO DEVICE CONNECTED</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="hud-grid">
+      
+      <!-- LEFT COLUMN: Mobile Status & Mirroring -->
+      <section class="hud-panel col-left">
+        <div class="panel-header">
+          <h2>DEVICE DIAGNOSTICS</h2>
+          <span class="panel-subtitle">LIVE METRICS</span>
+        </div>
+        <div class="panel-content">
+          <!-- Diagnostics Grid -->
+          <div class="diagnostics-summary">
+            <div class="diag-widget">
+              <span class="diag-label">SYSTEM</span>
+              <span class="diag-value" id="diag-os">N/A</span>
+            </div>
+            <div class="diag-widget">
+              <span class="diag-label">BATTERY</span>
+              <div class="battery-bar-container">
+                <div class="battery-level-fill" id="diag-battery-fill" style="width: 0%"></div>
+              </div>
+              <span class="diag-value" id="diag-battery">N/A</span>
+            </div>
+            <div class="diag-widget">
+              <span class="diag-label">TEMPERATURE</span>
+              <span class="diag-value" id="diag-temp">N/A</span>
+            </div>
+            <div class="diag-widget">
+              <span class="diag-label">RESOLUTION</span>
+              <span class="diag-value" id="diag-res">N/A</span>
+            </div>
+          </div>
+
+          <!-- Screen Mirror -->
+          <div class="screen-mirror-wrapper">
+            <div class="phone-frame">
+              <div class="phone-screen" id="phone-screen-container">
+                <img src="" id="phone-screenshot" class="hidden" alt="Mobile Screen Capture">
+                <div class="no-screen-fallback" id="screen-fallback">
+                  <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
+                    <line x1="12" y1="18" x2="12" y2="18.01" stroke-linecap="round" stroke-width="3" />
+                  </svg>
+                  <span>SCREEN CAPTURE OFFLINE</span>
+                </div>
+                <div class="screen-spinner hidden" id="screen-spinner">
+                  <div class="spinner"></div>
+                  <span>PULLING SCREEN...</span>
+                </div>
+              </div>
+            </div>
+            <button class="hud-btn btn-secondary btn-full" id="btn-refresh-screen" disabled>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M23 4v6h-6M1 20v-6h6" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+              CAPTURE LIVE SCREEN
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- CENTER COLUMN: Pipeline Control & Terminal -->
+      <section class="hud-panel col-center">
+        <div class="panel-header">
+          <h2>PIPELINE VISUALIZER</h2>
+          <span class="panel-subtitle">REAL-TIME DATA FLOW</span>
+        </div>
+        <div class="panel-content visualizer-content">
+          
+          <!-- Pipeline Flow Nodes -->
+          <div class="pipeline-flow-container">
+            <svg class="pipeline-connector-svg" id="pipeline-svg">
+              <path d="M 50 40 L 150 40" id="path-0" class="connector-path"></path>
+              <path d="M 150 40 L 250 40" id="path-1" class="connector-path"></path>
+              <path d="M 250 40 L 350 40" id="path-2" class="connector-path"></path>
+              <path d="M 350 40 L 450 40" id="path-3" class="connector-path"></path>
+              
+              <!-- Glow paths during execution -->
+              <path d="M 50 40 L 150 40" id="glow-path-0" class="glow-connector-path hidden"></path>
+              <path d="M 150 40 L 250 40" id="glow-path-1" class="glow-connector-path hidden"></path>
+              <path d="M 250 40 L 350 40" id="glow-path-2" class="glow-connector-path hidden"></path>
+              <path d="M 350 40 L 450 40" id="glow-path-3" class="glow-connector-path hidden"></path>
+            </svg>
+
+            <div class="pipeline-nodes">
+              <div class="pipeline-node" id="node-0" data-label="Speech/Text">
+                <div class="node-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+                  </svg>
+                </div>
+                <span>INPUT</span>
+              </div>
+              
+              <div class="pipeline-node" id="node-1" data-label="NLP Core">
+                <div class="node-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="16" x2="12" y2="12"/>
+                    <line x1="12" y1="8" x2="12.01" y2="8"/>
+                  </svg>
+                </div>
+                <span>INTENT</span>
+              </div>
+
+              <div class="pipeline-node" id="node-2" data-label="Resolver">
+                <div class="node-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                    <circle cx="9" cy="7" r="4"/>
+                    <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                    <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                  </svg>
+                </div>
+                <span>TARGET</span>
+              </div>
+
+              <div class="pipeline-node" id="node-3" data-label="ADB Compiler">
+                <div class="node-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="16 18 22 12 16 6"/>
+                    <polyline points="8 6 2 12 8 18"/>
+                  </svg>
+                </div>
+                <span>COMPILE</span>
+              </div>
+
+              <div class="pipeline-node" id="node-4" data-label="Device Driver">
+                <div class="node-circle">
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3"/>
+                  </svg>
+                </div>
+                <span>EXECUTE</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Console Terminal -->
+          <div class="console-wrapper">
+            <div class="console-header">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+              <span class="terminal-title">TERMINAL@NEXUS_ADB_FEED</span>
+            </div>
+            <div class="console-body" id="console-logs">
+              <div class="console-line system">[SYSTEM] NexusFlow initialized. Awaiting pipeline instruction.</div>
+              <div class="console-line system">[SYSTEM] Connect phone via USB data cable to active pipeline.</div>
+            </div>
+          </div>
+
+          <!-- Speech Controller -->
+          <div class="command-controls">
+            <!-- Audio Waveform Area -->
+            <div class="waveform-container hidden" id="waveform-wrapper">
+              <canvas id="voice-canvas" width="400" height="60"></canvas>
+              <span class="listening-text">LISTENING FOR COMMAND... (SAY CALL, WHATSAPP, OR SHUTDOWN)</span>
+            </div>
+
+            <!-- Inputs -->
+            <div class="input-row">
+              <button class="voice-trigger-btn" id="btn-voice-trigger">
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5" class="mic-icon">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+                </svg>
+              </button>
+              <input type="text" id="cmd-text-input" placeholder="Give a command (e.g. 'Yash ko call karo' or 'Shutdown PC')..." class="hud-input">
+              <button class="hud-btn btn-primary" id="btn-submit-cmd">EXECUTE</button>
+            </div>
+            <div class="language-helper">
+              Supports: Hindi / Hinglish / English Voice & Text Input
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- RIGHT COLUMN: Contacts Book & Settings -->
+      <section class="hud-panel col-right">
+        
+        <!-- Tab Selectors -->
+        <div class="tab-header">
+          <button class="tab-btn active" id="tab-btn-contacts">CONTACTS</button>
+          <button class="tab-btn" id="tab-btn-settings">SETTINGS</button>
+        </div>
+
+        <div class="panel-content tab-panel-content">
+          <!-- CONTACTS CONTAINER -->
+          <div class="tab-content" id="tab-content-contacts">
+            <div class="contacts-list" id="contacts-list-container">
+              <!-- Dynamically Loaded -->
+            </div>
+            
+            <!-- FEATURE 3: Sync From Phone Button -->
+            <button class="hud-btn btn-secondary btn-full btn-sm" id="btn-sync-contacts" style="margin-bottom: 10px;">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                <circle cx="9" cy="7" r="4"/>
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+              </svg>
+              SYNC PHONE CONTACTS
+            </button>
+            
+            <div class="contact-form">
+              <h3>ADD / EDIT CONTACT</h3>
+              <div class="form-inputs">
+                <input type="text" id="contact-name" placeholder="Name (e.g. Yash)" class="hud-input input-sm">
+                <input type="text" id="contact-phone" placeholder="Phone (e.g. 9876543210)" class="hud-input input-sm">
+                <button class="hud-btn btn-primary btn-sm" id="btn-save-contact">SAVE CONTACT</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- SETTINGS CONTAINER -->
+          <div class="tab-content hidden" id="tab-content-settings">
+            <div class="settings-form">
+              <div class="settings-group">
+                <h3>PHONE SECURITY</h3>
+                <label class="hud-label">Unlock Password (PIN)</label>
+                <input type="password" id="cfg-pin" placeholder="Enter device unlock PIN code" class="hud-input">
+                <span class="input-desc">Required to unlock PIN-protected lockscreen automatically.</span>
+              </div>
+
+              <div class="settings-group">
+                <h3>WHATSAPP AUTO-CLICK CALIBRATION</h3>
+                <div class="coords-row">
+                  <div>
+                    <label class="hud-label">X Axis Ratio</label>
+                    <input type="number" id="cfg-wx" step="0.01" min="0" max="1" placeholder="0.91" class="hud-input">
+                  </div>
+                  <div>
+                    <label class="hud-label">Y Axis Ratio</label>
+                    <input type="number" id="cfg-wy" step="0.01" min="0" max="1" placeholder="0.55" class="hud-input">
+                  </div>
+                </div>
+                <span class="input-desc">WhatsApp "Send" icon location based on screen width/height ratio. Recommended: 0.91 Width, 0.55 Height (with keyboard up).</span>
+              </div>
+
+              <button class="hud-btn btn-primary btn-full" id="btn-save-config">APPLY SYSTEM PROPERTIES</button>
+              
+              <!-- FEATURE 4: Wireless ADB Mode -->
+              <div class="settings-group" style="margin-top: 20px;">
+                <h3>WIRELESS ADB MODE</h3>
+                <span class="input-desc">Enable ADB over Wi-Fi so you can remove the USB cable after initial pairing. Both devices must be on the same WiFi network.</span>
+                <div class="wireless-controls">
+                  <span class="wireless-status" id="wireless-status">INACTIVE (USB ONLY)</span>
+                  <button class="hud-btn btn-secondary btn-full" id="btn-wireless-toggle">
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+                      <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+                      <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+                      <line x1="12" y1="20" x2="12.01" y2="20"/>
+                    </svg>
+                    ENABLE WIRELESS
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <!-- SHUTDOWN COUNTDOWN OVERLAY -->
+  <div class="shutdown-overlay hidden" id="shutdown-overlay">
+    <div class="shutdown-dialog">
+      <div class="skull-badge">⚠️</div>
+      <h2>CRITICAL SYSTEM WARNING</h2>
+      <p>Initiating PC System Shutdown in</p>
+      <div class="countdown-timer" id="shutdown-countdown">10</div>
+      <p class="warning-alert">ALL UNSAVED PROCESSES WILL BE TERMINATED</p>
+      
+      <button class="abort-btn" id="btn-abort-shutdown">
+        ABORT SHUTDOWN SEQUENCE
+      </button>
+    </div>
+  </div>
+
+  <!-- JavaScript Modules -->
+  <script src="js/particles.js"></script>
+  <script src="js/voice.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "nexusflow",
+  "version": "1.0.0",
+  "description": "Advanced PC-Mobile Pipeline Controller via ADB",
+  "main": "server/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.16.0"
+  }
+}
