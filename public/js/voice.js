@@ -81,49 +81,89 @@ let animationFrameId = null;
 let isMicAccessGranted = false;
 let wavePhase = 0; // Phase for fallback animation
 
+// Advanced Pro-Max Speech Engine States
+let forceStop = false;
+
 // Initialize Speech Recognition if supported
 if (SpeechRecognition) {
   recognition = new SpeechRecognition();
-  recognition.continuous = false;
-  recognition.interimResults = false;
+  // MAX LEVEL API UPGRADES:
+  recognition.continuous = true;      // Keep listening continuously
+  recognition.interimResults = true;  // Show live real-time text transcription!
   recognition.maxAlternatives = 1;
-  // Use en-IN (Indian English) for much better Hinglish / English command detection
   recognition.lang = 'en-IN'; 
 
   recognition.onstart = () => {
     isListening = true;
+    forceStop = false;
     btnVoiceTrigger.classList.add('active');
     waveformWrapper.classList.remove('hidden');
     
-    // Start canvas visualizer
     startAudioVisualizer();
     if (typeof appendTerminalLine === 'function') {
-      appendTerminalLine('[SPEECH] Microphone active. Speak command now...', 'system');
+      appendTerminalLine('[SPEECH ENGINE V2.0] Active. Max-Level Real-Time API ready...', 'system');
     }
   };
 
   recognition.onresult = (event) => {
-    const transcript = event.results[0][0].transcript;
-    if (typeof appendTerminalLine === 'function') {
-      appendTerminalLine(`[SPEECH] Voice Captured: "${transcript}"`, 'adb-info');
+    let interimTranscript = '';
+    let finalTranscript = '';
+
+    for (let i = event.resultIndex; i < event.results.length; ++i) {
+      if (event.results[i].isFinal) {
+        finalTranscript += event.results[i][0].transcript;
+      } else {
+        interimTranscript += event.results[i][0].transcript;
+      }
     }
-    
-    // Put transcript into text box and auto-submit
-    cmdInput.value = transcript;
-    if (typeof submitCommand === 'function') {
-      submitCommand();
+
+    // Live typing effect (Interim)
+    if (interimTranscript) {
+      cmdInput.value = interimTranscript;
+    }
+
+    // Final result
+    if (finalTranscript) {
+      cmdInput.value = finalTranscript.trim();
+      if (typeof appendTerminalLine === 'function') {
+        appendTerminalLine(`[SPEECH] Captured: "${finalTranscript.trim()}"`, 'adb-success');
+      }
+      
+      // Auto-submit command
+      if (typeof submitCommand === 'function') {
+        submitCommand();
+      }
+      
+      // Momentarily stop to process, then auto-resume if needed
+      forceStop = true;
+      recognition.stop();
+      setTimeout(() => stopListeningState(), 500);
     }
   };
 
   recognition.onerror = (event) => {
     if (typeof appendTerminalLine === 'function') {
-      appendTerminalLine(`[SPEECH] Recognition error: ${event.error}`, 'adb-error');
+      appendTerminalLine(`[SPEECH ERROR] Engine reported: ${event.error}. Auto-recovering...`, 'warning');
     }
-    stopListeningState();
+    
+    // If user denied mic or network failed, we must stop.
+    if (event.error === 'not-allowed' || event.error === 'network') {
+      forceStop = true;
+      stopListeningState();
+    }
   };
 
   recognition.onend = () => {
-    stopListeningState();
+    if (!forceStop && isListening) {
+      // PRO-MAX AUTO RECONNECT LOGIC (Deeply fixes random disconnects)
+      try {
+        recognition.start();
+      } catch (e) {
+        stopListeningState();
+      }
+    } else {
+      stopListeningState();
+    }
   };
 } else {
   btnVoiceTrigger.style.display = 'none';
@@ -135,8 +175,10 @@ btnVoiceTrigger.addEventListener('click', () => {
   if (!recognition) return;
 
   if (isListening) {
+    forceStop = true;
     recognition.stop();
   } else {
+    forceStop = false;
     try {
       recognition.start();
     } catch (e) {
@@ -148,9 +190,13 @@ btnVoiceTrigger.addEventListener('click', () => {
 
 function stopListeningState() {
   isListening = false;
+  forceStop = true;
   btnVoiceTrigger.classList.remove('active');
   waveformWrapper.classList.add('hidden');
   stopAudioVisualizer();
+  if (cmdInput.value && !cmdInput.value.includes('vani')) {
+    // optional clear if aborted halfway
+  }
 }
 
 // ==========================================================================

@@ -2,6 +2,11 @@
  * Hinglish/English Natural Language Command Parser for NexusFlow
  */
 
+let nlpContext = {
+  lastContact: null,
+  pendingAction: null
+};
+
 export function parseCommand(text, contacts = []) {
   let normalized = text.toLowerCase().trim();
   
@@ -24,6 +29,30 @@ export function parseCommand(text, contacts = []) {
   logDebug(`Normalizing input command: "${text}" -> "${cleanedText}" (Wake word detected: ${wakeWordDetected})`);
 
   const wakeWordPrefix = wakeWordDetected ? 'Vani Activated ➔ ' : '';
+
+  // --- CONVERSATIONAL CONTEXT CHECK ---
+  if (nlpContext.pendingAction && nlpContext.pendingAction.type === 'WHATSAPP_CALL') {
+    if (cleanedText.includes('video')) {
+       const name = nlpContext.pendingAction.name;
+       nlpContext.pendingAction = null;
+       return { 
+         intent: 'WHATSAPP_VIDEO_CALL', 
+         pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_VIDEO_CALL)', 'ADB Video Call Tap'], 
+         details: { name } 
+       };
+    } else if (cleanedText.includes('audio') || cleanedText.includes('voice')) {
+       const name = nlpContext.pendingAction.name;
+       nlpContext.pendingAction = null;
+       return { 
+         intent: 'WHATSAPP_AUDIO_CALL', 
+         pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_AUDIO_CALL)', 'ADB Audio Call Tap'], 
+         details: { name } 
+       };
+    } else if (cleanedText.includes('cancel') || cleanedText.includes('rehnedo') || cleanedText.includes('chhod do')) {
+       nlpContext.pendingAction = null;
+       return { intent: 'CANCEL', pipeline: ['Input Received', 'Cancelled Context'], details: {} };
+    }
+  }
 
   // 1. Detect Shutdown Intent
   const shutdownKeywords = [
@@ -133,6 +162,11 @@ export function parseCommand(text, contacts = []) {
   if (['notification', 'notifications', 'show notifications', 'open notifications', 'notification shade'].some(k => cleanedText.includes(k))) {
     return { intent: 'NOTIFICATIONS', pipeline: ['Input Received', wakeWordPrefix + 'NLP (NOTIFICATIONS)', 'ADB Statusbar Cmd'], details: { wakeWordDetected } };
   }
+  
+  // God Mode Sequence
+  if (['god mode', 'showtime', 'show time', 'hacker mode', 'initiate protocol', 'execute protocol'].some(k => cleanedText.includes(k))) {
+    return { intent: 'GOD_MODE', pipeline: ['Input Received', wakeWordPrefix + 'NLP (GOD_MODE)', 'ADB Rapid Sequence Execution'], details: { wakeWordDetected } };
+  }
 
   // 3. Search for phone numbers in the command
   // Matches 10-digit numbers or international numbers (e.g. +919876543210, 9876543210)
@@ -155,6 +189,18 @@ export function parseCommand(text, contacts = []) {
     }
   }
 
+  // Context-Aware Memory: Resolve pronouns to last contact
+  const hasPronoun = ['him', 'her', 'them', 'usko', 'usey', 'isko', 'isey', 'usse', 'usko'].some(p => cleanedText.includes(` ${p} `) || cleanedText.endsWith(` ${p}`));
+  if (!resolvedContact && hasPronoun && nlpContext.lastContact) {
+    resolvedContact = nlpContext.lastContact;
+    logDebug(`NLP Context Memory: Resolved pronoun to previous contact "${resolvedContact.name}"`);
+  }
+
+  // Store context for future commands
+  if (resolvedContact) {
+    nlpContext.lastContact = resolvedContact;
+  }
+
   // Match WhatsApp keyword
   const isWhatsApp = cleanedText.includes('whatsapp') || 
                      cleanedText.includes('message') || 
@@ -173,7 +219,61 @@ export function parseCommand(text, contacts = []) {
   const targetNumber = resolvedContact ? resolvedContact.number : rawPhoneNumber;
   const targetName = resolvedContact ? resolvedContact.name : (rawPhoneNumber ? 'Unknown Number' : null);
 
-  // 5. Build WhatsApp Action
+  // --- INTERACTIVE WHATSAPP PIPELINE ---
+  
+  // A. Search / Open Chat
+  const searchMatch = cleanedText.match(/(?:search|dhundho)\s+(.+)/i);
+  if (searchMatch) {
+    const rawName = searchMatch[1].trim().replace(/\b(ko|karo)\b/ig, '').trim();
+    // Use targetName if resolved, otherwise use the dynamically extracted rawName
+    const finalName = targetName || rawName;
+    if (finalName) {
+       return {
+         intent: 'WHATSAPP_OPEN_CHAT',
+         pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_OPEN_CHAT)', 'Live In-App Search', 'ADB Chat Open'],
+         details: { name: finalName, number: targetNumber, wakeWordDetected }
+       };
+    }
+  }
+
+  // B. Type Message (Without Sending)
+  const typeMatch = cleanedText.match(/(?:type|likho|likh do)\s+(?:sms|message|msg)?\s*(.+)/i);
+  if (typeMatch) {
+    return {
+       intent: 'WHATSAPP_TYPE_MESSAGE',
+       pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_TYPE_MESSAGE)', 'ADB Input Text'],
+       details: { message: typeMatch[1].trim(), wakeWordDetected }
+    };
+  }
+
+  // C. Send Message (Tap Send)
+  if (['send sms', 'send message', 'bhej do', 'send kar do', 'send it'].some(k => cleanedText.includes(k))) {
+    return {
+       intent: 'WHATSAPP_SEND_MESSAGE',
+       pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_SEND_MESSAGE)', 'ADB Button Tap'],
+       details: { wakeWordDetected }
+    };
+  }
+
+  // D. Audio/Video Call (WhatsApp Call) - Prompting
+  const waCallMatch = cleanedText.match(/(?:whatsapp|watsapp)\s*(?:pe)?\s*call\s*(?:karo|lagao)?\s*(.+)?/i);
+  if (waCallMatch) {
+    let extractedName = targetName;
+    if (!extractedName && waCallMatch[1]) {
+      extractedName = waCallMatch[1].trim().replace(/\b(ko|karo)\b/ig, '').trim();
+    }
+    
+    // Set conversational state
+    nlpContext.pendingAction = { type: 'WHATSAPP_CALL', name: extractedName };
+    
+    return {
+       intent: 'WHATSAPP_ASK_CALL_TYPE',
+       pipeline: ['Input Received', wakeWordPrefix + 'NLP (WHATSAPP_ASK_CALL_TYPE)', 'TTS Prompt'],
+       details: { name: extractedName, number: targetNumber, wakeWordDetected }
+    };
+  }
+
+  // 5. Build WhatsApp Action (Generic Auto-Send)
   if (isWhatsApp && targetNumber) {
     // Extract message payload
     let message = extractWhatsAppMessage(cleanedText, targetName, rawPhoneNumber);

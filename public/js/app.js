@@ -24,6 +24,8 @@ const phoneScreenshot = document.getElementById('phone-screenshot');
 const screenFallback = document.getElementById('screen-fallback');
 const screenSpinner = document.getElementById('screen-spinner');
 const btnRefreshScreen = document.getElementById('btn-refresh-screen');
+const btnLiveFeed = document.getElementById('btn-live-feed');
+const liveFeedText = document.getElementById('live-feed-text');
 
 const consoleLogs = document.getElementById('console-logs');
 const cmdTextInput = document.getElementById('cmd-text-input');
@@ -118,6 +120,14 @@ socket.addEventListener('message', (event) => {
     case 'shutdown_timer_complete':
       hideShutdownOverlay();
       appendTerminalLine('[SYSTEM] Shutdown sequence complete. Bye!', 'adb-error');
+      break;
+
+    case 'system_alert':
+      showToast('SYSTEM ALERT', data.message, 'warning');
+      appendTerminalLine(`[ALERT] ${data.message}`, 'adb-warning');
+      if (data.ttsMessage && typeof window.vaniSpeak === 'function') {
+        window.vaniSpeak(data.ttsMessage);
+      }
       break;
   }
 });
@@ -290,13 +300,38 @@ function updateDiagnosticsHUD(data) {
 
   diagRes.textContent = data.resolution;
   btnRefreshScreen.disabled = false;
+  btnLiveFeed.disabled = false;
 }
 
 // Pull Mobile Screenshot
 btnRefreshScreen.addEventListener('click', async () => {
   screenSpinner.classList.remove('hidden');
   appendTerminalLine('[DIAGNOSTICS] Requesting system screencap...', 'system');
-  
+  await fetchScreenshot();
+});
+
+let liveFeedInterval = null;
+btnLiveFeed.addEventListener('click', () => {
+  if (liveFeedInterval) {
+    // Stop Live Feed
+    clearInterval(liveFeedInterval);
+    liveFeedInterval = null;
+    liveFeedText.textContent = 'LIVE FEED';
+    btnLiveFeed.classList.remove('active', 'btn-primary');
+    btnLiveFeed.classList.add('btn-secondary');
+    appendTerminalLine('[SYSTEM] Live Screen Feed stopped.', 'system');
+  } else {
+    // Start Live Feed
+    liveFeedText.textContent = 'STOP FEED';
+    btnLiveFeed.classList.add('active', 'btn-primary');
+    btnLiveFeed.classList.remove('btn-secondary');
+    appendTerminalLine('[SYSTEM] Starting Live Screen Feed (1 FPS)...', 'adb-info');
+    fetchScreenshot(); // initial fetch
+    liveFeedInterval = setInterval(fetchScreenshot, 2000); // 2 sec interval for stability
+  }
+});
+
+async function fetchScreenshot() {
   try {
     const res = await fetch('/api/screenshot');
     const data = await res.json();
@@ -305,16 +340,16 @@ btnRefreshScreen.addEventListener('click', async () => {
       phoneScreenshot.src = data.url;
       phoneScreenshot.classList.remove('hidden');
       screenFallback.classList.add('hidden');
-      appendTerminalLine('[DIAGNOSTICS] Screen capture pulled successfully.', 'adb-success');
+      if (!liveFeedInterval) appendTerminalLine('[DIAGNOSTICS] Screencap successful.', 'adb-success');
     } else {
-      throw new Error(data.error);
+      appendTerminalLine(`[ERROR] Screencap failed: ${data.error}`, 'adb-error');
     }
-  } catch (err) {
-    appendTerminalLine(`[DIAGNOSTICS] Screenshot error: ${err.message}`, 'adb-error');
+  } catch (error) {
+    appendTerminalLine(`[ERROR] Screencap fetch failed: ${error.message}`, 'adb-error');
   } finally {
     screenSpinner.classList.add('hidden');
   }
-});
+}
 
 // ==========================================================================
 // Command Execution Trigger
@@ -575,6 +610,30 @@ if (btnSyncContacts) {
     } finally {
       btnSyncContacts.disabled = false;
       btnSyncContacts.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> SYNC PHONE CONTACTS`;
+    }
+  });
+}
+
+const btnClearContacts = document.getElementById('btn-clear-contacts');
+if (btnClearContacts) {
+  btnClearContacts.addEventListener('click', async () => {
+    if (!confirm('Are you sure you want to delete ALL contacts?')) return;
+    
+    btnClearContacts.disabled = true;
+    try {
+      const res = await fetch('/api/contacts', { method: 'DELETE' });
+      if (res.ok) {
+        contactsData = [];
+        renderContacts();
+        appendTerminalLine('[SYSTEM] All contacts cleared successfully.', 'adb-success');
+        if (typeof window.vaniSpeak === 'function') {
+          window.vaniSpeak('All contacts have been deleted successfully.');
+        }
+      }
+    } catch (err) {
+      alert('Failed to clear contacts');
+    } finally {
+      btnClearContacts.disabled = false;
     }
   });
 }

@@ -30,7 +30,7 @@
     <header class="hud-header">
       <div class="header-logo">
         <span class="logo-accent">⚡</span>
-        <h1>NEXUSFLOW <span class="version">v2.0.0</span></h1>
+        <h1>NEXUSFLOW <span class="version">v7.5.0</span></h1>
       </div>
       <div class="header-status">
         <div class="status-indicator">
@@ -94,13 +94,21 @@
                 </div>
               </div>
             </div>
-            <button class="hud-btn btn-secondary btn-full" id="btn-refresh-screen" disabled>
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M23 4v6h-6M1 20v-6h6" />
-                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
-              </svg>
-              CAPTURE LIVE SCREEN
-            </button>
+            <div style="display: flex; gap: 10px;">
+              <button class="hud-btn btn-secondary btn-full" id="btn-refresh-screen" disabled style="flex: 1;">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M23 4v6h-6M1 20v-6h6" />
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                </svg>
+                REFRESH SCREEN
+              </button>
+              <button class="hud-btn btn-secondary btn-full" id="btn-live-feed" disabled style="flex: 1;">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span id="live-feed-text">LIVE FEED</span>
+              </button>
+            </div>
           </div>
         </div>
       </section>
@@ -249,6 +257,15 @@
                 <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
               </svg>
               SYNC PHONE CONTACTS
+            </button>
+
+            <!-- CLEAR CONTACTS BUTTON -->
+            <button class="hud-btn btn-secondary btn-full btn-sm" id="btn-clear-contacts" style="margin-bottom: 10px; background: rgba(255,0,0,0.2); border-color: #ff3333; color: #ff9999;">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"></polyline>
+                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+              </svg>
+              CLEAR ALL CONTACTS
             </button>
             
             <div class="contact-form">

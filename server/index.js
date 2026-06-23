@@ -14,6 +14,12 @@ import {
   unlockPhone, 
   makeCall, 
   sendWhatsAppMessage, 
+  openWhatsAppChat,
+  typeText,
+  tapWhatsAppSend,
+  tapWhatsAppCall,
+  tapWhatsAppVideoCall,
+  searchAndOpenWhatsAppContact,
   captureScreen, 
   setLogCallback,
   syncPhoneContacts,
@@ -88,6 +94,15 @@ app.post('/api/contacts', (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to save contacts' });
+  }
+});
+
+app.delete('/api/contacts', (req, res) => {
+  try {
+    fs.writeFileSync(CONTACTS_FILE, JSON.stringify([], null, 2));
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to clear contacts' });
   }
 });
 
@@ -356,6 +371,14 @@ async function executePipeline(commandText) {
     commandSummary = `am start -a android.intent.action.CALL -d tel:${parsed.details.number}`;
   } else if (parsed.intent === 'WHATSAPP') {
     commandSummary = `am start -a android.intent.action.VIEW -d "whatsapp://send?phone=${parsed.details.number}" && input tap ${config.whatsappCoords.x}, ${config.whatsappCoords.y}`;
+  } else if (parsed.intent === 'WHATSAPP_OPEN_CHAT') {
+    commandSummary = `am start -a android.intent.action.VIEW -d "whatsapp://send?phone=${parsed.details.number}"`;
+  } else if (parsed.intent === 'WHATSAPP_TYPE_MESSAGE') {
+    commandSummary = `input text "${parsed.details.message}"`;
+  } else if (parsed.intent === 'WHATSAPP_SEND_MESSAGE') {
+    commandSummary = `input keyevent 66`;
+  } else if (parsed.intent === 'WHATSAPP_AUDIO_CALL') {
+    commandSummary = `input tap [call_button]`;
   }
 
   broadcast({ type: 'pipeline_step', step: 3, status: 'success', message: `Script compiled successfully: ${commandSummary}` });
@@ -382,6 +405,35 @@ async function executePipeline(commandText) {
     } else if (parsed.intent === 'WHATSAPP') {
       await sendWhatsAppMessage(parsed.details.number, parsed.details.message, config.whatsappCoords);
       ttsMessage = `WhatsApp message sent to ${parsed.details.name || 'the contact'}.`;
+    } else if (parsed.intent === 'WHATSAPP_OPEN_CHAT') {
+      if (parsed.details.number) {
+        await openWhatsAppChat(parsed.details.number);
+      } else {
+        await searchAndOpenWhatsAppContact(parsed.details.name);
+      }
+      ttsMessage = `WhatsApp chat opened for ${parsed.details.name}. What would you like to type?`;
+    } else if (parsed.intent === 'WHATSAPP_TYPE_MESSAGE') {
+      await typeText(parsed.details.message);
+      ttsMessage = `Message typed. Say "Vani send message" to send it.`;
+    } else if (parsed.intent === 'WHATSAPP_SEND_MESSAGE') {
+      await tapWhatsAppSend();
+      ttsMessage = `Message sent on WhatsApp!`;
+    } else if (parsed.intent === 'WHATSAPP_ASK_CALL_TYPE') {
+      ttsMessage = `Aap ${parsed.details.name || 'ko'} audio call karna chahte hain ya video call?`;
+    } else if (parsed.intent === 'WHATSAPP_AUDIO_CALL') {
+      if (parsed.details.name) {
+        await searchAndOpenWhatsAppContact(parsed.details.name);
+      }
+      await tapWhatsAppCall();
+      ttsMessage = `Initiating audio call to ${parsed.details.name || 'the contact'}.`;
+    } else if (parsed.intent === 'WHATSAPP_VIDEO_CALL') {
+      if (parsed.details.name) {
+        await searchAndOpenWhatsAppContact(parsed.details.name);
+      }
+      await tapWhatsAppVideoCall();
+      ttsMessage = `Initiating video call to ${parsed.details.name || 'the contact'}.`;
+    } else if (parsed.intent === 'CANCEL') {
+      ttsMessage = `Okay, maine cancel kar diya.`;
     } else if (parsed.intent === 'VOLUME_UP') {
       await volumeUp();
       ttsMessage = 'Volume increased.';
@@ -439,7 +491,17 @@ async function executePipeline(commandText) {
     } else if (parsed.intent === 'NOTIFICATIONS') {
       await openNotifications();
       ttsMessage = 'Notification shade opened.';
+    } else if (parsed.intent === 'GOD_MODE') {
+      broadcast({ type: 'pipeline_step', step: 4, status: 'pending', message: 'Executing GOD_MODE rapid override...' });
+      await toggleWifi(true);
+      await setBrightness(255);
+      await toggleFlashlight(true);
+      await openApp('camera');
+      await takePhoto();
+      await mediaPlayPause();
+      ttsMessage = 'God mode sequence executed. System override complete.';
     }
+
 
     broadcast({ type: 'pipeline_step', step: 4, status: 'success', message: 'Execution completed. Action transmitted.' });
     broadcast({ type: 'pipeline_end', success: true, ttsMessage });
@@ -501,14 +563,42 @@ function cancelPcShutdown() {
   }
 }
 
-// Boot the server and auto-check ADB platform tools
-server.listen(PORT, async () => {
-  console.log(`[SERVER] Running at http://localhost:${PORT}`);
-  
-  // Auto setup ADB in background so server starts immediately
+// ==========================================================================
+// Autonomous System Health Poller
+// ==========================================================================
+let lastAlertTime = 0;
+setInterval(async () => {
   try {
-    await ensureAdbInstalled();
+    const diagnostics = await getDeviceDiagnostics();
+    if (diagnostics && diagnostics.connected) {
+      const isCritical = diagnostics.batteryLevel <= 15 || (diagnostics.batteryTemp && diagnostics.batteryTemp >= 40);
+      const now = Date.now();
+      // Only alert once every 5 minutes maximum
+      if (isCritical && (now - lastAlertTime > 5 * 60 * 1000)) {
+        lastAlertTime = now;
+        broadcast({ 
+          type: 'system_alert', 
+          message: 'Warning: Device battery is low or temperature is critical.',
+          ttsMessage: 'Warning! Device temperature or battery level is critical. Please check your device.'
+        });
+      }
+    }
   } catch (e) {
-    console.error('Initial ADB Setup error:', e.message);
+    // Ignore errors for background poller
   }
+}, 30000); // Check every 30 seconds
+
+// Boot up
+server.listen(PORT, () => {
+  console.log(`\n[SERVER] NexusFlow v7.5 Pro-Max Running at http://localhost:${PORT}`);
+  ensureAdbInstalled().catch(console.error);
+  
+  // Automatically open Google Chrome to ensure Web Speech API compatibility
+  exec(`start chrome http://localhost:${PORT}`, (err) => {
+    if (err) {
+      console.log('[SERVER] Notice: Could not auto-launch Chrome. Please open it manually if needed.');
+    } else {
+      console.log('[SERVER] Successfully auto-launched Google Chrome for Max-Level Voice API support.');
+    }
+  });
 });

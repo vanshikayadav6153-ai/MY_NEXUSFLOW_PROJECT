@@ -710,6 +710,15 @@ body {
   color: var(--text-primary);
   white-space: pre-wrap;
   word-break: break-all;
+  animation: typing-appear 0.5s cubic-bezier(0, 0.7, 0.2, 1) forwards;
+  opacity: 0;
+  transform: translateX(-10px);
+}
+
+@keyframes typing-appear {
+  0% { opacity: 0; transform: translateX(-10px); text-shadow: 0 0 0 transparent; }
+  50% { opacity: 1; transform: translateX(2px); text-shadow: 0 0 10px currentColor; }
+  100% { opacity: 1; transform: translateX(0); text-shadow: 0 0 4px currentColor; }
 }
 
 .console-line.system {
