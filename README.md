@@ -1,3 +1,12 @@
+**Run Commands:**
+```bash
+npm start
+npm run dev
+node server/index.js
+Stop-Process -Name "node" -Force
+
+```
+
 # 🚀 NexusFlow Pro-Max
 
 NexusFlow is an advanced, cyberpunk-themed device automation pipeline and NLP assistant.
@@ -20,7 +29,7 @@ NexusFlow is an advanced, cyberpunk-themed device automation pipeline and NLP as
    ```bash
    node server/index.js
    ```
-4. Open `http://localhost:3000` in your browser.
+4. Open  in your browser.
 5. Connect your Android phone with **USB Debugging** enabled.
 
 ## Pro-Max Commands

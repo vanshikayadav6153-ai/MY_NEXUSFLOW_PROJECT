@@ -647,52 +647,317 @@ export async function toggleFlashlight(state) {
   }
 }
 
+/** 
+ * ========================================================================
+ * DYNAMIC APP LAUNCHER ENGINE v4.0 — ZERO SIDE-EFFECTS
+ * 
+ * ROOT CAUSE FIX: The old 'monkey' tool was injecting a RANDOM touch/tap 
+ * event into the app right after opening it, which was hitting search bars
+ * and other UI elements — causing apps to go to search screens.
+ * 
+ * NEW APPROACH: Uses 'cmd package resolve-activity' to find the exact
+ * launcher activity, then 'am start -n' to open it CLEANLY with zero
+ * random events injected. Works on ALL Android 7+ devices.
+ * ========================================================================
+ */
+
+// Cache of resolved packages so we don't re-scan every time
+const resolvedPackageCache = {};
+
+/**
+ * Resolves the launcher activity component for a package.
+ * Returns the component string (e.g. "com.whatsapp/.Main") or null.
+ */
+async function resolveLauncherActivity(deviceId, packageName) {
+  try {
+    const { stdout, stderr } = await execAsync(
+      `"${adbPath}" -s ${deviceId} shell cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ${packageName}`
+    );
+    const output = (stdout || '') + '\n' + (stderr || '');
+    const lines = output.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    
+    // The last line containing '/' is the component (e.g. "com.whatsapp/.Main")
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes('/') && !lines[i].includes('=')) {
+        return lines[i];
+      }
+    }
+  } catch (e) {
+    // Even on error, check stdout/stderr for the component
+    const output = (e.stdout || '') + '\n' + (e.stderr || '');
+    const lines = output.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].includes('/') && !lines[i].includes('=')) {
+        return lines[i];
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Checks if a package is installed on the device.
+ * Returns true/false.
+ */
+async function isPackageInstalled(deviceId, packageName) {
+  try {
+    const { stdout } = await execAsync(
+      `"${adbPath}" -s ${deviceId} shell pm path ${packageName}`
+    );
+    return (stdout || '').includes('package:');
+  } catch (e) {
+    return ((e.stdout || '') + (e.stderr || '')).includes('package:');
+  }
+}
+
+/**
+ * Attempts to launch a package CLEANLY using am start (no monkey).
+ * Returns true if launched, false if package not found/can't launch.
+ */
+async function tryLaunchPackage(deviceId, packageName) {
+  // Step 1: Resolve the exact launcher activity
+  const component = await resolveLauncherActivity(deviceId, packageName);
+  
+  if (component) {
+    // Step 2: Launch cleanly with am start — ZERO random events
+    try {
+      const { stdout, stderr } = await execAsync(
+        `"${adbPath}" -s ${deviceId} shell am start -n "${component}"`
+      );
+      const output = (stdout || '') + '\n' + (stderr || '');
+      if (output.includes('Error:') || output.includes('does not exist') || output.includes('ClassNotFoundException')) {
+        log(`am start failed for ${component}: ${output.trim().substring(0, 100)}`, 'warning');
+        return false;
+      }
+      log(`Cleanly launched: ${component}`, 'success');
+      return true;
+    } catch (e) {
+      const output = (e.stdout || '') + '\n' + (e.stderr || '');
+      // am start often writes to stderr even on success — check for real errors
+      if (output.includes('Starting:') || output.includes('Warning: Activity')) {
+        log(`Launched (with warning): ${component}`, 'success');
+        return true;
+      }
+      if (output.includes('Error:') || output.includes('does not exist')) {
+        return false;
+      }
+      // If no clear error, assume it launched (stderr noise is common)
+      log(`Launched: ${component} (stderr present but no error)`, 'success');
+      return true;
+    }
+  }
+  
+  // Step 3: If resolve failed, check if package even exists
+  const installed = await isPackageInstalled(deviceId, packageName);
+  if (!installed) {
+    return false; // Package not on this device
+  }
+  
+  // Step 4: Package exists but resolve-activity failed — last resort fallback
+  // Use am start with the main intent and let Android figure it out
+  try {
+    const { stdout, stderr } = await execAsync(
+      `"${adbPath}" -s ${deviceId} shell am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n ${packageName}/.MainActivity`
+    );
+    const output = (stdout || '') + '\n' + (stderr || '');
+    if (output.includes('Error:') || output.includes('does not exist')) {
+      return false;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Scans all installed packages on the device and finds the best match
+ * for a given app name using intelligent multi-keyword fuzzy matching.
+ */
+async function findPackageOnDevice(deviceId, appName) {
+  // Check cache first
+  if (resolvedPackageCache[appName]) {
+    log(`Package cache hit: ${appName} -> ${resolvedPackageCache[appName]}`, 'info');
+    return resolvedPackageCache[appName];
+  }
+
+  log(`Scanning device for package matching "${appName}"...`, 'info');
+  
+  let listOutput;
+  try {
+    const { stdout } = await execAsync(`"${adbPath}" -s ${deviceId} shell pm list packages`);
+    listOutput = stdout;
+  } catch (e) {
+    listOutput = e.stdout || '';
+  }
+
+  const allPackages = listOutput
+    .split('\n')
+    .map(l => l.trim().replace('package:', ''))
+    .filter(l => l.length > 0);
+
+  const searchName = appName.toLowerCase().replace(/\s+/g, '');
+  
+  // Score each package - higher is better match
+  let bestMatch = null;
+  let bestScore = 0;
+
+  for (const pkg of allPackages) {
+    const pkgLower = pkg.toLowerCase();
+    let score = 0;
+    
+    // Exact app name in package (e.g., "calculator" in "com.vivo.calculator")
+    if (pkgLower.includes(searchName)) {
+      score += 100;
+    }
+    
+    // Check individual words for multi-word app names (e.g., "play store" -> "vending")
+    const words = appName.toLowerCase().split(/\s+/);
+    for (const word of words) {
+      if (word.length > 2 && pkgLower.includes(word)) {
+        score += 30;
+      }
+    }
+    
+    // Penalize system/framework packages that are not user-facing apps
+    if (pkgLower.includes('provider') || pkgLower.includes('overlay') || 
+        pkgLower.includes('service') || pkgLower.includes('framework') ||
+        pkgLower.includes('widget') || pkgLower.includes('plugin') ||
+        pkgLower.includes('config') || pkgLower.includes('extension')) {
+      score -= 50;
+    }
+    
+    // Bonus for shorter package names (more likely to be the main app)
+    if (score > 0) {
+      score += Math.max(0, 30 - pkg.length);
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = pkg;
+    }
+  }
+
+  if (bestMatch && bestScore > 0) {
+    resolvedPackageCache[appName] = bestMatch;
+    log(`Dynamic package match: "${appName}" -> ${bestMatch} (score: ${bestScore})`, 'success');
+    return bestMatch;
+  }
+
+  return null;
+}
+
 /** Open a specific app by package name or common name */
 export async function openApp(appName) {
   const id = await getFirstDevice();
   
-  // Map common names to package names
-  const appMap = {
-    'camera': 'com.android.camera',
-    'gallery': 'com.google.android.apps.photos',
-    'photos': 'com.google.android.apps.photos',
-    'settings': 'com.android.settings',
-    'chrome': 'com.android.chrome',
-    'youtube': 'com.google.android.youtube',
-    'maps': 'com.google.android.apps.maps',
-    'gmail': 'com.google.android.gm',
-    'calculator': 'com.google.android.calculator',
-    'clock': 'com.google.android.deskclock',
-    'calendar': 'com.google.android.calendar',
-    'whatsapp': 'com.whatsapp',
-    'instagram': 'com.instagram.android',
-    'facebook': 'com.facebook.katana',
-    'twitter': 'com.twitter.android',
-    'spotify': 'com.spotify.music',
-    'telegram': 'org.telegram.messenger',
-    'netflix': 'com.netflix.mediaclient',
-    'phone': 'com.android.dialer',
-    'contacts': 'com.android.contacts',
-    'messages': 'com.google.android.apps.messaging',
-    'files': 'com.google.android.documentsui',
-    'play store': 'com.android.vending',
-    'music': 'com.google.android.music'
-  };
+  // Wake device if screen is off
+  const screenActive = await isScreenOn(id);
+  if (!screenActive) {
+    log('Screen is OFF. Waking device...', 'info');
+    await runAdb(`-s ${id} shell input keyevent KEYCODE_WAKEUP`);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    // Quick swipe to dismiss lock screen (no PIN)
+    const sizeOutput = await runAdb(`-s ${id} shell wm size`);
+    const sizeMatch = sizeOutput.match(/Physical size:\s+(\d+)x(\d+)/);
+    if (sizeMatch) {
+      const w = parseInt(sizeMatch[1]);
+      const h = parseInt(sizeMatch[2]);
+      await runAdb(`-s ${id} shell input swipe ${Math.floor(w/2)} ${Math.floor(h*0.8)} ${Math.floor(w/2)} ${Math.floor(h*0.2)} 250`);
+    } else {
+      await runAdb(`-s ${id} shell input swipe 500 1600 500 400 250`);
+    }
+    await new Promise(resolve => setTimeout(resolve, 800));
+  }
 
-  const pkg = appMap[appName.toLowerCase()] || appName;
-  log(`Opening app: ${appName} (${pkg})...`, 'info');
+  // LAYER 1: Static package map (covers common/known packages)
+  const appMap = {
+    'camera': ['com.android.camera', 'com.vivo.alphacamera', 'com.sec.android.app.camera', 'com.huawei.camera', 'com.oppo.camera', 'com.oneplus.camera', 'com.miui.camera'],
+    'gallery': ['com.google.android.apps.photos', 'com.vivo.gallery', 'com.miui.gallery', 'com.sec.android.gallery3d', 'com.coloros.gallery3d'],
+    'photos': ['com.google.android.apps.photos'],
+    'settings': ['com.android.settings'],
+    'chrome': ['com.android.chrome'],
+    'youtube': ['com.google.android.youtube'],
+    'maps': ['com.google.android.apps.maps'],
+    'gmail': ['com.google.android.gm'],
+    'calculator': ['com.google.android.calculator', 'com.vivo.calculator', 'com.miui.calculator', 'com.sec.android.app.popupcalculator', 'com.coloros.calculator', 'com.oneplus.calculator'],
+    'clock': ['com.google.android.deskclock', 'com.android.deskclock', 'com.sec.android.app.clockpackage'],
+    'calendar': ['com.google.android.calendar', 'com.android.calendar'],
+    'whatsapp': ['com.whatsapp'],
+    'instagram': ['com.instagram.android'],
+    'facebook': ['com.facebook.katana'],
+    'twitter': ['com.twitter.android', 'com.twitter.android.lite'],
+    'x': ['com.twitter.android'],
+    'spotify': ['com.spotify.music'],
+    'telegram': ['org.telegram.messenger'],
+    'netflix': ['com.netflix.mediaclient'],
+    'phone': ['com.android.dialer', 'com.android.phone', 'com.samsung.android.dialer', 'com.vivo.dailer'],
+    'dialer': ['com.android.dialer', 'com.android.phone'],
+    'contacts': ['com.android.contacts', 'com.google.android.contacts'],
+    'messages': ['com.google.android.apps.messaging', 'com.android.mms', 'com.samsung.android.messaging'],
+    'files': ['com.google.android.apps.nbu.files', 'com.android.filemanager', 'com.android.documentsui', 'com.mi.android.globalFileexplorer'],
+    'file manager': ['com.android.filemanager', 'com.google.android.apps.nbu.files', 'com.mi.android.globalFileexplorer'],
+    'play store': ['com.android.vending'],
+    'playstore': ['com.android.vending'],
+    'music': ['com.google.android.music', 'com.android.bbkmusic', 'com.miui.player'],
+    'snapchat': ['com.snapchat.android'],
+    'amazon': ['in.amazon.mShop.android.shopping', 'com.amazon.mShop.android.shopping'],
+    'flipkart': ['com.flipkart.android'],
+    'paytm': ['net.one97.paytm'],
+    'phonepe': ['com.phonepe.app'],
+    'gpay': ['com.google.android.apps.nbu.paisa.user'],
+    'google pay': ['com.google.android.apps.nbu.paisa.user'],
+    'zomato': ['com.application.zomato'],
+    'swiggy': ['in.swiggy.android'],
+    'uber': ['com.ubercab'],
+    'ola': ['com.olacabs.customer'],
+    'hotstar': ['in.startv.hotstar', 'com.jio.media.stb.ondemand'],
+    'jio': ['com.jio.media.jiobeats'],
+    'notes': ['com.google.android.keep', 'com.android.notes'],
+  };
   
-  try {
-    await runAdb(`-s ${id} shell monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`);
-    log(`App "${appName}" launched successfully.`, 'success');
-  } catch (error) {
-    log(`Failed to open ${appName}. Trying alternative launch...`, 'warning');
-    try {
-      await runAdb(`-s ${id} shell am start -n ${pkg}/.MainActivity`);
-    } catch (e2) {
-      throw new Error(`App "${appName}" could not be found or launched.`);
+  const nameLower = appName.toLowerCase().trim();
+  const candidatePackages = appMap[nameLower] || [];
+  
+  log(`Opening app: "${appName}" | Candidates: ${candidatePackages.length > 0 ? candidatePackages.join(', ') : 'none (will use dynamic search)'}`, 'info');
+  
+  // LAYER 2: Try each candidate from static map
+  for (const pkg of candidatePackages) {
+    log(`Trying static package: ${pkg}...`, 'info');
+    const launched = await tryLaunchPackage(id, pkg);
+    if (launched) {
+      log(`App "${appName}" launched successfully via ${pkg}.`, 'success');
+      resolvedPackageCache[nameLower] = pkg; // Cache for next time
+      return;
     }
   }
+
+  if (candidatePackages.length > 0) {
+    log(`All static packages failed for "${appName}". Falling back to dynamic search...`, 'warning');
+  }
+  
+  // LAYER 3: Dynamic package resolution from device
+  const dynamicPkg = await findPackageOnDevice(id, appName);
+  
+  if (dynamicPkg) {
+    log(`Trying dynamically resolved package: ${dynamicPkg}...`, 'info');
+    const launched = await tryLaunchPackage(id, dynamicPkg);
+    if (launched) {
+      log(`App "${appName}" launched successfully via dynamic resolution: ${dynamicPkg}`, 'success');
+      return;
+    }
+  }
+
+  // LAYER 4: Last resort - try using the app name directly as a package name
+  if (nameLower.includes('.')) {
+    log(`Trying "${nameLower}" as direct package name...`, 'info');
+    const launched = await tryLaunchPackage(id, nameLower);
+    if (launched) {
+      log(`App "${appName}" launched using direct package name.`, 'success');
+      return;
+    }
+  }
+  
+  throw new Error(`App "${appName}" could not be found or launched on this device. Package not installed.`);
 }
 
 /** Open a URL in default browser */

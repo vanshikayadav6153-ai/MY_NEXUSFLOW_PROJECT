@@ -112,9 +112,19 @@ export function parseCommand(text, contacts = []) {
     return { intent: 'FLASHLIGHT', pipeline: ['Input Received', wakeWordPrefix + 'NLP (FLASHLIGHT)', 'ADB Torch Toggle'], details: { state: turnOn, wakeWordDetected } };
   }
   // Open App
-  const openAppMatch = cleanedText.match(/(?:open|launch|start|kholo|chalu kar)\s+(.+?)(?:\s+app)?$/);
-  if (openAppMatch && !cleanedText.includes('url') && !cleanedText.includes('http') && !cleanedText.includes('www') && !cleanedText.includes('website')) {
-    return { intent: 'OPEN_APP', pipeline: ['Input Received', wakeWordPrefix + 'NLP (OPEN_APP)', 'ADB Monkey Launch'], details: { appName: openAppMatch[1].trim(), wakeWordDetected } };
+  let appNameForOpen = null;
+  const hindiFirstMatch = cleanedText.match(/(.+?)\s+(?:open|launch|start|kholo|chalu)(?:\s+karo|\s+kar|\s+do|\s+app)?$/i);
+  if (hindiFirstMatch) {
+    appNameForOpen = hindiFirstMatch[1].trim();
+  } else {
+    const englishFirstMatch = cleanedText.match(/(?:open|launch|start|kholo|chalu kar|chalu)\s+(.+?)(?:\s+app)?$/i);
+    if (englishFirstMatch) {
+      appNameForOpen = englishFirstMatch[1].trim();
+    }
+  }
+
+  if (appNameForOpen && !cleanedText.includes('url') && !cleanedText.includes('http') && !cleanedText.includes('www') && !cleanedText.includes('website')) {
+    return { intent: 'OPEN_APP', pipeline: ['Input Received', wakeWordPrefix + 'NLP (OPEN_APP)', 'ADB Monkey Launch'], details: { appName: appNameForOpen, wakeWordDetected } };
   }
   // Open URL
   const urlMatch = cleanedText.match(/(?:open|browse|go to|visit|kholo)\s+(?:url|website|site)?\s*(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9]+\.com[^\s]*)/);
