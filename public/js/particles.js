@@ -1,7 +1,3 @@
-// ==========================================================================
-// NexusFlow Particle Network Background — Pro Max Level
-// ==========================================================================
-
 const particleCanvas = document.getElementById('particle-canvas');
 if (particleCanvas) {
   const ctx = particleCanvas.getContext('2d');
@@ -22,7 +18,6 @@ if (particleCanvas) {
   window.addEventListener('resize', resize);
   resize();
 
-  // Track mouse for interactive particle repulsion
   window.addEventListener('mousemove', (e) => {
     mouse.x = e.clientX;
     mouse.y = e.clientY;
@@ -41,7 +36,6 @@ if (particleCanvas) {
       this.speedY = (Math.random() - 0.5) * PARTICLE_SPEED;
       this.baseAlpha = Math.random() * 0.5 + 0.3;
       this.alpha = this.baseAlpha;
-      // Randomize between cyan and purple shades
       this.hue = Math.random() > 0.5 ? 185 : 280;
       this.pulsePhase = Math.random() * Math.PI * 2;
     }
@@ -50,15 +44,12 @@ if (particleCanvas) {
       this.x += this.speedX;
       this.y += this.speedY;
 
-      // Soft pulse effect
       this.pulsePhase += 0.02;
       this.alpha = this.baseAlpha + Math.sin(this.pulsePhase) * 0.15;
 
-      // Bounce off edges
       if (this.x < 0 || this.x > width) this.speedX *= -1;
       if (this.y < 0 || this.y > height) this.speedY *= -1;
 
-      // Mouse repulsion
       if (mouse.x !== null) {
         const dx = this.x - mouse.x;
         const dy = this.y - mouse.y;
@@ -77,7 +68,6 @@ if (particleCanvas) {
       ctx.fillStyle = `hsla(${this.hue + hueShift}, 100%, 70%, ${this.alpha})`;
       ctx.fill();
 
-      // Glow ring around particle
       ctx.beginPath();
       ctx.arc(this.x, this.y, this.size * 3, 0, Math.PI * 2);
       ctx.fillStyle = `hsla(${this.hue + hueShift}, 100%, 60%, ${this.alpha * 0.08})`;
@@ -85,7 +75,6 @@ if (particleCanvas) {
     }
   }
 
-  // Initialize particles
   for (let i = 0; i < PARTICLE_COUNT; i++) {
     particles.push(new Particle());
   }
@@ -110,14 +99,12 @@ if (particleCanvas) {
     }
   }
 
-  // Energy pulse rings that expand outward periodically
   let pulseRings = [];
 
   function spawnPulse(x, y) {
     pulseRings.push({ x, y, radius: 5, alpha: 0.6, maxRadius: 250 });
   }
 
-  // Periodic pulse from center
   setInterval(() => {
     spawnPulse(width / 2, height / 2);
   }, 6000);
@@ -141,7 +128,6 @@ if (particleCanvas) {
     }
   }
 
-  // Floating hexagons in background
   const hexagons = [];
   for (let i = 0; i < 6; i++) {
     hexagons.push({
@@ -184,15 +170,12 @@ if (particleCanvas) {
     });
   }
 
-  // Main animation loop
   function animate() {
     requestAnimationFrame(animate);
     frameCount++;
 
-    // Very slow hue shift for color cycling
     hueShift = Math.sin(frameCount * 0.001) * 15;
 
-    // Trail effect (semi-transparent clear)
     ctx.fillStyle = 'rgba(5, 8, 20, 0.15)';
     ctx.fillRect(0, 0, width, height);
 
@@ -208,7 +191,6 @@ if (particleCanvas) {
 
   animate();
 
-  // Expose pulse spawner globally so app.js can trigger bursts on pipeline events
   window.spawnParticlePulse = (x, y) => {
     spawnPulse(x || width / 2, y || height / 2);
   };

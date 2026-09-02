@@ -5,55 +5,84 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { exec } from 'child_process';
-import { promisify } from 'util';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
+import multer from 'multer';
 
-// Import our custom modules
-import { 
-  ensureAdbInstalled, 
-  getDeviceDiagnostics, 
-  unlockPhone, 
-  makeCall, 
-  sendWhatsAppMessage, 
-  openWhatsAppChat,
-  typeText,
-  tapWhatsAppSend,
-  tapWhatsAppCall,
-  tapWhatsAppVideoCall,
-  searchAndOpenWhatsAppContact,
-  captureScreen, 
+import {
+  ensureAdbInstalled,
+  captureScreen,
   setLogCallback,
   syncPhoneContacts,
   enableWirelessAdb,
   disableWirelessAdb,
-  volumeUp,
-  volumeDown,
-  volumeMute,
-  setBrightness,
-  toggleFlashlight,
-  openApp,
-  openUrl,
-  toggleWifi,
-  toggleBluetooth,
-  takePhoto,
-  mediaPlayPause,
-  mediaNext,
-  mediaPrevious,
-  pressHome,
-  pressBack,
-  openRecents,
-  openNotifications
+  isPhoneLocked,
+  unlockPhone
 } from './adb.js';
-import { parseCommand } from './nlp.js';
+import { getDiagnostics, currentDeviceKey, invalidateDiagnostics } from './deviceState.js';
+import { JobQueue, JOB_STATES } from './jobQueue.js';
+import { configurePipeline, runCommandText, runAssistantText } from './pipeline.js';
+import { isAiEnabled, AI_MODEL } from './ai/client.js';
+import {
+  assertJsonSchema,
+  sendSafeError,
+  createHttpAccessMiddleware,
+  createRateLimiter,
+  authorizeWebSocketUpgrade,
+  isRequestFromLoopback
+} from './security.js';
+import {
+  CONFIG_SCHEMA,
+  CONTACTS_SCHEMA,
+  readPublicConfig,
+  writeConfig,
+  mergeConfig,
+  readContacts,
+  writeContacts,
+  readConfig,
+  getAuthToken,
+  getAllowedOrigins,
+  RUNTIME_DIR,
+  ensureRuntimeDir
+} from './config/index.js';
+import {
+  listPhoneFiles,
+  pullFileFromPhone,
+  pushFileToPhone,
+  deletePhoneFile,
+  createPhoneDirectory,
+  getStorageInfo
+} from './fileTransfer.js';
+import {
+  getMacros,
+  getMacroById,
+  saveMacro,
+  updateMacro,
+  deleteMacro,
+  executeMacro,
+  validateMacro
+} from './macros.js';
+import { captureFrame, sendTap, sendSwipe, scaleToDevice } from './screenMirror.js';
+import {
+  installApk,
+  uninstallPackage,
+  listThirdPartyPackages,
+  startRecording,
+  stopRecording,
+  isRecording
+} from './deviceOps.js';
 
-const execAsync = promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+try {
+  process.loadEnvFile(path.join(__dirname, '..', '.env'));
+  console.log('[CONFIG] Loaded .env');
+} catch {  }
+
 const PORT = process.env.PORT || 3000;
 
-// Setup database file paths
 const CONTACTS_FILE = path.join(__dirname, 'contacts.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
-// Initialize files if they don't exist
 if (!fs.existsSync(CONTACTS_FILE)) {
   fs.writeFileSync(CONTACTS_FILE, JSON.stringify([
     { id: '1', name: 'Mom', number: '9876543210' },
@@ -71,18 +100,65 @@ if (!fs.existsSync(CONFIG_FILE)) {
 }
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '256kb' }));
+
+const AUTH_TOKEN = getAuthToken();
+const ALLOWED_ORIGINS = getAllowedOrigins(process.env, PORT);
+console.log(AUTH_TOKEN
+  ? '[SECURITY] Token auth ENABLED (NEXUSFLOW_AUTH_TOKEN set).'
+  : '[SECURITY] Local-only mode: remote clients are refused. Set NEXUSFLOW_AUTH_TOKEN for LAN access.');
+
+const apiLimiter = createRateLimiter({ windowMs: 60_000, max: 300 });
+const screenLimiter = createRateLimiter({ windowMs: 60_000, max: 120 });
+const mirrorLimiter = createRateLimiter({ windowMs: 60_000, max: 800 });
+const inputLimiter = createRateLimiter({ windowMs: 60_000, max: 900 });
+app.use('/api', apiLimiter.middleware);
+
+app.post('/api/auth/login', express.json({ limit: '4kb' }), (req, res) => {
+  if (!AUTH_TOKEN) return res.json({ ok: true, mode: 'local-only' });
+  const supplied = typeof req.body?.token === 'string' ? req.body.token : '';
+  const ok = supplied.length === AUTH_TOKEN.length && timingSafeStrEqual(supplied, AUTH_TOKEN);
+  if (!ok) return res.status(401).json({ ok: false, error: 'Invalid token' });
+  return res.json({ ok: true, mode: 'token' });
+});
+app.get('/api/auth/status', (req, res) => {
+  res.json({ authRequired: Boolean(AUTH_TOKEN) });
+});
+
+const BOOT_TIME = Date.now();
+app.get('/api/health', async (req, res) => {
+  let device = null;
+  try {
+    const d = await getDiagnostics();
+    device = d.connected ? { model: d.model, android: d.androidVersion, battery: d.batteryLevel } : null;
+  } catch {  }
+  res.json({
+    status: 'ok',
+    uptimeSeconds: Math.round((Date.now() - BOOT_TIME) / 1000),
+    authRequired: Boolean(AUTH_TOKEN),
+    aiEnabled: isAiEnabled(),
+    deviceConnected: Boolean(device),
+    device
+  });
+});
+
+app.use('/api', createHttpAccessMiddleware({ authToken: AUTH_TOKEN }));
+
 app.use(express.static(path.join(__dirname, '../public')));
 
-// Global state for PC shutdown timer
 let shutdownTimer = null;
 let shutdownTimeLeft = 10;
 
-// HTTP API Routes
+function timingSafeStrEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
 app.get('/api/contacts', (req, res) => {
   try {
-    const data = fs.readFileSync(CONTACTS_FILE, 'utf8');
-    res.json(JSON.parse(data));
+    res.json(readContacts());
   } catch (error) {
     res.status(500).json({ error: 'Failed to read contacts' });
   }
@@ -90,16 +166,17 @@ app.get('/api/contacts', (req, res) => {
 
 app.post('/api/contacts', (req, res) => {
   try {
-    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(req.body, null, 2));
+    assertJsonSchema(req.body ?? [], CONTACTS_SCHEMA);
+    writeContacts(req.body);
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to save contacts' });
+    sendSafeError(res, error);
   }
 });
 
 app.delete('/api/contacts', (req, res) => {
   try {
-    fs.writeFileSync(CONTACTS_FILE, JSON.stringify([], null, 2));
+    writeContacts([]);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to clear contacts' });
@@ -108,8 +185,7 @@ app.delete('/api/contacts', (req, res) => {
 
 app.get('/api/config', (req, res) => {
   try {
-    const data = fs.readFileSync(CONFIG_FILE, 'utf8');
-    res.json(JSON.parse(data));
+    res.json(readPublicConfig());
   } catch (error) {
     res.status(500).json({ error: 'Failed to read config' });
   }
@@ -117,46 +193,103 @@ app.get('/api/config', (req, res) => {
 
 app.post('/api/config', (req, res) => {
   try {
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(req.body, null, 2));
+    assertJsonSchema(req.body ?? {}, CONFIG_SCHEMA);
+    writeConfig(mergeConfig(req.body ?? {}));
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to save config' });
+    sendSafeError(res, error);
   }
 });
 
 app.get('/api/diagnostics', async (req, res) => {
   try {
-    const diagnostics = await getDeviceDiagnostics();
+    const diagnostics = await getDiagnostics();
     res.json(diagnostics);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+const SCREENSHOT_PATH = path.join(RUNTIME_DIR, 'screen.png');
 app.get('/api/screenshot', async (req, res) => {
   try {
-    const screenshotPath = path.join(__dirname, '../public/screen.png');
-    await captureScreen(screenshotPath);
-    res.json({ success: true, url: '/screen.png?t=' + Date.now() });
+    ensureRuntimeDir();
+    await captureScreen(SCREENSHOT_PATH);
+    res.json({ success: true, url: '/api/screen/current?t=' + Date.now() });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// FEATURE 3: Sync contacts from connected phone
+app.get('/api/screen/current', screenLimiter.middleware, (req, res) => {
+  if (!fs.existsSync(SCREENSHOT_PATH)) {
+    return res.status(404).json({ error: 'No screenshot captured yet' });
+  }
+  res.set('Cache-Control', 'no-store');
+  res.type('png').sendFile(SCREENSHOT_PATH);
+});
+
+app.get('/api/mirror/frame', mirrorLimiter.middleware, async (req, res) => {
+  const result = await captureFrame();
+  if (!result.success) return res.status(502).json({ error: result.error || 'capture failed' });
+  res.set('Cache-Control', 'no-store');
+  res.type('png').send(result.buffer);
+});
+
+app.post('/api/mirror/tap', inputLimiter.middleware, async (req, res) => {
+  try {
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    const { x, y } = scaleToDevice(req.body?.x, req.body?.y, diag.resolution);
+    await sendTap(x, y, diag.deviceId);
+    res.json({ success: true, x, y });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.post('/api/mirror/swipe', inputLimiter.middleware, async (req, res) => {
+  try {
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    const a = scaleToDevice(req.body?.x1, req.body?.y1, diag.resolution);
+    const b = scaleToDevice(req.body?.x2, req.body?.y2, diag.resolution);
+    await sendSwipe(a.x, a.y, b.x, b.y, req.body?.duration, diag.deviceId);
+    res.json({ success: true });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.post('/api/unlock', async (req, res) => {
+  try {
+    const cfg = readConfig();
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    const result = await new Promise((resolve, reject) => {
+      jobs.enqueue(diag.deviceId, async () => {
+        try { resolve(await unlockPhone(cfg.unlockPin)); } catch (e) { reject(e); }
+      }, { kind: 'unlock' });
+    });
+    invalidateDiagnostics();
+    res.json({ success: true, ...result });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
 app.post('/api/sync-contacts', async (req, res) => {
   try {
     const phoneContacts = await syncPhoneContacts();
-    
-    // Merge with existing contacts (avoid duplicates by number)
+
     let existing = [];
     try {
       existing = JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
-    } catch (e) { /* empty */ }
-    
+    } catch (e) {  }
+
     const existingNumbers = new Set(existing.map(c => c.number));
     let addedCount = 0;
-    
+
     for (const pc of phoneContacts) {
       if (!existingNumbers.has(pc.number)) {
         existing.push(pc);
@@ -164,11 +297,11 @@ app.post('/api/sync-contacts', async (req, res) => {
         addedCount++;
       }
     }
-    
+
     fs.writeFileSync(CONTACTS_FILE, JSON.stringify(existing, null, 2));
-    res.json({ 
-      success: true, 
-      totalSynced: phoneContacts.length, 
+    res.json({
+      success: true,
+      totalSynced: phoneContacts.length,
       newAdded: addedCount,
       totalContacts: existing.length
     });
@@ -177,7 +310,6 @@ app.post('/api/sync-contacts', async (req, res) => {
   }
 });
 
-// FEATURE 4: Wireless ADB toggle
 app.post('/api/wireless/enable', async (req, res) => {
   try {
     const result = await enableWirelessAdb();
@@ -196,11 +328,236 @@ app.post('/api/wireless/disable', async (req, res) => {
   }
 });
 
-// Setup server and WebSockets
-const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const aiLimiter = createRateLimiter({ windowMs: 60_000, max: 30 });
 
-// Broadcast helper
+app.get('/api/ai/status', (req, res) => {
+  res.json({ enabled: isAiEnabled(), model: isAiEnabled() ? AI_MODEL : null });
+});
+
+app.post('/api/ai/chat', aiLimiter.middleware, async (req, res) => {
+  try {
+    const message = typeof req.body?.message === 'string' ? req.body.message : '';
+    if (!message.trim()) return res.status(400).json({ error: 'message is required' });
+    if (message.length > 4000) return res.status(400).json({ error: 'message too long' });
+    const session = { aiHistory: [], requireConfirm: true, confirm: async () => false };
+    const result = await runAssistantText(message, session);
+    res.json({ reply: result.reply, ok: result.ok, actionsTaken: result.actionsTaken || [] });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.get('/api/jobs', (req, res) => {
+  res.json({ jobs: jobs.list({ limit: 100 }) });
+});
+
+app.post('/api/jobs/:id/cancel', (req, res) => {
+  const cancelled = jobs.cancel(req.params.id);
+  res.json({ success: cancelled });
+});
+
+
+const uploadsDir = path.join(__dirname, '../uploads');
+const downloadsDir = path.join(__dirname, '../downloads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+if (!fs.existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
+
+const upload = multer({
+  dest: uploadsDir,
+  limits: { fileSize: 500 * 1024 * 1024 }
+});
+
+app.get('/api/files/list', async (req, res) => {
+  try {
+    const phonePath = req.query.path || '/sdcard';
+    const result = await listPhoneFiles(phonePath);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/files/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+
+    const phoneDest = req.body.destination || '/sdcard/Download';
+
+    const safeName = path.basename(String(req.file.originalname || 'upload'))
+      .replace(/[^A-Za-z0-9._-]/g, '_')
+      .slice(0, 200) || 'upload';
+    const renamedPath = path.join(uploadsDir, safeName);
+    if (path.dirname(path.resolve(renamedPath)) !== path.resolve(uploadsDir)) {
+      throw new Error('Rejected upload path');
+    }
+    fs.renameSync(req.file.path, renamedPath);
+
+    const result = await pushFileToPhone(renamedPath, phoneDest);
+
+    try { fs.unlinkSync(renamedPath); } catch (e) {  }
+
+    broadcast({ type: 'file_transfer_complete', action: 'upload', result });
+
+    res.json(result);
+  } catch (error) {
+    if (req.file && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch (e) {  }
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/files/download', async (req, res) => {
+  try {
+    const phonePath = req.query.path;
+    if (!phonePath) {
+      return res.status(400).json({ error: 'No file path specified' });
+    }
+
+    const result = await pullFileFromPhone(phonePath, downloadsDir);
+
+    if (result.success) {
+      res.download(result.localPath, result.fileName, (err) => {
+        try { fs.unlinkSync(result.localPath); } catch (e) {  }
+      });
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/files/delete', async (req, res) => {
+  try {
+    const { path: filePath, isDirectory } = req.body;
+    if (!filePath) {
+      return res.status(400).json({ error: 'No file path specified' });
+    }
+
+    const result = await deletePhoneFile(filePath, isDirectory);
+    broadcast({ type: 'file_transfer_complete', action: 'delete', result });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/files/mkdir', async (req, res) => {
+  try {
+    const { path: dirPath } = req.body;
+    if (!dirPath) {
+      return res.status(400).json({ error: 'No directory path specified' });
+    }
+
+    const result = await createPhoneDirectory(dirPath);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/files/storage', async (req, res) => {
+  try {
+    const result = await getStorageInfo();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/apps/install', upload.single('apk'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No APK provided' });
+  const tmp = path.join(uploadsDir, `install_${Date.now()}.apk`);
+  try {
+    fs.renameSync(req.file.path, tmp);
+    const diag = await getDiagnostics();
+    if (!diag.connected) throw new Error('No device connected');
+    const result = await installApk(tmp, diag.deviceId);
+    res.json(result);
+  } catch (error) {
+    sendSafeError(res, error);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {  }
+    if (req.file && fs.existsSync(req.file.path)) { try { fs.unlinkSync(req.file.path); } catch {  } }
+  }
+});
+
+app.get('/api/apps/list', async (req, res) => {
+  try {
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    res.json({ packages: await listThirdPartyPackages(diag.deviceId) });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.delete('/api/apps/:pkg', async (req, res) => {
+  try {
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    res.json(await uninstallPackage(req.params.pkg, diag.deviceId));
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+let lastRecording = null;
+
+app.get('/api/record/status', (req, res) => res.json({ recording: isRecording() }));
+
+app.post('/api/record/start', async (req, res) => {
+  try {
+    const diag = await getDiagnostics();
+    if (!diag.connected) return res.status(409).json({ error: 'No device connected' });
+    res.json(await startRecording(diag.deviceId));
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.post('/api/record/stop', async (req, res) => {
+  try {
+    const result = await stopRecording();
+    lastRecording = { path: result.path, fileName: result.fileName };
+    res.json({ success: true, fileName: result.fileName, size: result.size, url: '/api/record/latest?t=' + Date.now() });
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.get('/api/record/latest', screenLimiter.middleware, (req, res) => {
+  if (!lastRecording || !fs.existsSync(lastRecording.path)) {
+    return res.status(404).json({ error: 'No recording available' });
+  }
+  res.download(lastRecording.path, lastRecording.fileName);
+});
+
+
+const server = createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const result = authorizeWebSocketUpgrade(req, {
+    authToken: AUTH_TOKEN,
+    allowedOrigins: ALLOWED_ORIGINS,
+    tokenParam: 'token'
+  });
+  if (!result.ok) {
+    socket.write(`HTTP/1.1 ${result.statusCode} ${result.code}\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    ws._req = req;
+    ws._loopback = isRequestFromLoopback(req);
+    wss.emit('connection', ws, req);
+  });
+});
+
 function broadcast(data) {
   const message = JSON.stringify(data);
   wss.clients.forEach(client => {
@@ -210,34 +567,141 @@ function broadcast(data) {
   });
 }
 
-// Connect ADB logs to WebSocket clients
 setLogCallback((logObj) => {
   broadcast({ type: 'adb_log', log: logObj });
 });
 
+const jobs = new JobQueue({
+  onEvent: (event) => broadcast({ type: 'job_event', event })
+});
+
+async function enqueueCommand(text, session, opts = {}) {
+  const key = await currentDeviceKey();
+  return jobs.enqueue(
+    key,
+    () => runCommandText(text, session, opts),
+    { kind: 'command', text, source: opts.source || 'text' }
+  );
+}
+
+const MACRO_SESSION = { nlpContext: {}, requireConfirm: false };
+
+async function enqueueMacro(id) {
+  const key = await currentDeviceKey();
+  return jobs.enqueue(key, () => executeMacro(
+    id,
+    (command) => runCommandText(command, MACRO_SESSION),
+    (step) => broadcast({ type: 'macro_step', step })
+  ), { kind: 'macro', id });
+}
+
+app.get('/api/macros', (req, res) => {
+  res.json({ macros: getMacros() });
+});
+
+app.post('/api/macros', (req, res) => {
+  try {
+    validateMacro(req.body);
+    res.json(saveMacro(req.body));
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.put('/api/macros/:id', (req, res) => {
+  try {
+    const { id: _ignored, ...updates } = req.body || {};
+    validateMacro(updates);
+    const result = updateMacro(req.params.id, updates);
+    res.status(result.success ? 200 : 404).json(result);
+  } catch (error) {
+    sendSafeError(res, error);
+  }
+});
+
+app.delete('/api/macros/:id', (req, res) => {
+  const result = deleteMacro(req.params.id);
+  res.status(result.success ? 200 : 404).json(result);
+});
+
+app.post('/api/macros/:id/run', async (req, res) => {
+  const macro = getMacroById(req.params.id);
+  if (!macro) return res.status(404).json({ success: false, error: 'Macro not found' });
+  const snapshot = await enqueueMacro(req.params.id);
+  res.json({ success: true, job: snapshot, macro: macro.name });
+});
+
 wss.on('connection', (ws) => {
-  console.log('[WS] Client connected');
-  
-  // Send immediate ADB status update
-  getDeviceDiagnostics().then(diagnostics => {
+  const loopback = ws._loopback !== false;
+  console.log(`[WS] Client connected (${loopback ? 'loopback' : 'remote'})`);
+
+  const pendingConfirms = new Map();
+
+  function confirm(summary) {
+    const id = randomUUID();
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        pendingConfirms.delete(id);
+        resolve(false);
+      }, 45_000);
+      pendingConfirms.set(id, (approved) => {
+        clearTimeout(timer);
+        pendingConfirms.delete(id);
+        resolve(Boolean(approved));
+      });
+      ws.send(JSON.stringify({ type: 'confirm_request', id, summary }));
+    });
+  }
+
+  ws.session = {
+    id: randomUUID(),
+    nlpContext: { lastContact: null, pendingAction: null },
+    requireConfirm: !loopback,
+    confirm
+  };
+
+  getDiagnostics().then(diagnostics => {
     ws.send(JSON.stringify({ type: 'diagnostics', data: diagnostics }));
   });
 
   ws.on('message', async (messageData) => {
     try {
       const payload = JSON.parse(messageData);
-      
+
       if (payload.type === 'execute_command') {
-        const commandText = payload.command;
-        await executePipeline(commandText);
-      } 
-      
+        const alternatives = Array.isArray(payload.alternatives)
+          ? payload.alternatives.filter((s) => typeof s === 'string').slice(0, 5)
+          : [];
+        const snapshot = await enqueueCommand(String(payload.command || ''), ws.session, {
+          alternatives,
+          source: payload.source === 'voice' ? 'voice' : 'text'
+        });
+        ws.send(JSON.stringify({ type: 'command_queued', job: snapshot }));
+      }
+
+      else if (payload.type === 'ai_chat') {
+        const message = String(payload.message || '').slice(0, 4000);
+        if (message.trim()) {
+          const key = await currentDeviceKey();
+          jobs.enqueue(key, () => runAssistantText(message, ws.session), { kind: 'ai_chat' });
+        }
+      }
+
+      else if (payload.type === 'confirm_action') {
+        const resolver = pendingConfirms.get(String(payload.id || ''));
+        if (resolver) resolver(payload.approved === true);
+      }
+
       else if (payload.type === 'cancel_shutdown') {
         cancelPcShutdown();
       }
-      
+
+      else if (payload.type === 'cancel_job') {
+        jobs.cancel(String(payload.jobId || ''));
+      }
+
       else if (payload.type === 'request_diagnostics') {
-        const diagnostics = await getDeviceDiagnostics();
+        const diagnostics = await getDiagnostics();
         ws.send(JSON.stringify({ type: 'diagnostics', data: diagnostics }));
       }
     } catch (err) {
@@ -246,297 +710,27 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    for (const resolver of pendingConfirms.values()) resolver(false);
+    pendingConfirms.clear();
     console.log('[WS] Client disconnected');
   });
 });
 
-/**
- * Executes the entire parsed intent pipeline step-by-step
- */
-async function executePipeline(commandText) {
-  broadcast({ type: 'pipeline_start', command: commandText });
-
-  // Read current configuration and contacts
-  let contacts = [];
-  let config = { unlockPin: '', whatsappCoords: { x: 0.91, y: 0.55 } };
-  
-  try {
-    contacts = JSON.parse(fs.readFileSync(CONTACTS_FILE, 'utf8'));
-    config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  } catch (e) {
-    console.error('Failed to parse database files', e);
-  }
-
-  // Step 1: NLP Intent Extraction
-  broadcast({ type: 'pipeline_step', step: 0, status: 'pending', message: 'Parsing natural language intent...' });
-  await new Promise(resolve => setTimeout(resolve, 800)); // Dramatic speed effect
-
-  const parsed = parseCommand(commandText, contacts);
-  
-  if (parsed.details && parsed.details.wakeWordDetected) {
-    broadcast({ 
-      type: 'adb_log', 
-      log: { 
-        type: 'success', 
-        message: `[WAKE WORD] Wake word 'Vani' authenticated! Triggering automated pipelines...` 
-      } 
-    });
-  }
-  
-  if (parsed.intent === 'UNKNOWN') {
-    broadcast({ 
-      type: 'pipeline_step', 
-      step: 0, 
-      status: 'failed', 
-      message: `Failed to extract intent from command: "${commandText}"` 
-    });
-    broadcast({ type: 'pipeline_end', success: false, error: 'Command not recognized' });
-    return;
-  }
-
-  broadcast({ 
-    type: 'pipeline_step', 
-    step: 0, 
-    status: 'success', 
-    message: `Intent detected: ${parsed.intent}. Pipeline structured: [${parsed.pipeline.join(' ➔ ')}]` 
-  });
-  
-  // Step 2: Contact Resolution / Parameter Extraction
-  broadcast({ type: 'pipeline_step', step: 1, status: 'pending', message: 'Verifying command parameters...' });
-  await new Promise(resolve => setTimeout(resolve, 600));
-
-  if (parsed.intent === 'CALL' || parsed.intent === 'WHATSAPP') {
-    if (!parsed.details.number) {
-      broadcast({ 
-        type: 'pipeline_step', 
-        step: 1, 
-        status: 'failed', 
-        message: `Contact or phone number could not be resolved from command.` 
-      });
-      broadcast({ type: 'pipeline_end', success: false, error: 'Unresolved phone number' });
-      return;
-    }
-    broadcast({ 
-      type: 'pipeline_step', 
-      step: 1, 
-      status: 'success', 
-      message: `Resolved Contact: ${parsed.details.name || 'Raw Number'} (${parsed.details.number})` 
-    });
-  } else {
-    broadcast({ 
-      type: 'pipeline_step', 
-      step: 1, 
-      status: 'success', 
-      message: `Parameters resolved: Target device is ${parsed.details.target}` 
-    });
-  }
-
-  // Step 3: Device / System Handshake
-  broadcast({ type: 'pipeline_step', step: 2, status: 'pending', message: 'Checking execution endpoint state...' });
-  
-  if (parsed.intent === 'SHUTDOWN') {
-    // Local PC command has no ADB dependency
-    broadcast({ type: 'pipeline_step', step: 2, status: 'success', message: 'PC System online. Proceeding...' });
-  } else {
-    // ADB check
-    const diagnostics = await getDeviceDiagnostics();
-    if (!diagnostics.connected) {
-      broadcast({ 
-        type: 'pipeline_step', 
-        step: 2, 
-        status: 'failed', 
-        message: 'Device disconnected! Ensure phone is connected via Type-C USB cable and USB Debugging is ON.' 
-      });
-      broadcast({ type: 'pipeline_end', success: false, error: 'Mobile device not connected' });
-      return;
-    }
-    broadcast({ 
-      type: 'pipeline_step', 
-      step: 2, 
-      status: 'success', 
-      message: `Connected to ${diagnostics.brand} ${diagnostics.model} via ADB (USB status: Active)` 
-    });
-  }
-
-  // Step 4: Compiling script commands
-  broadcast({ type: 'pipeline_step', step: 3, status: 'pending', message: 'Compiling automation script execution vectors...' });
-  await new Promise(resolve => setTimeout(resolve, 500));
-  
-  let commandSummary = '';
-  if (parsed.intent === 'SHUTDOWN') {
-    commandSummary = 'shutdown /s /t 10';
-  } else if (parsed.intent === 'UNLOCK') {
-    commandSummary = `input keyevent 82 && input text ${config.unlockPin || '****'} && input keyevent 66`;
-  } else if (parsed.intent === 'CALL') {
-    commandSummary = `am start -a android.intent.action.CALL -d tel:${parsed.details.number}`;
-  } else if (parsed.intent === 'WHATSAPP') {
-    commandSummary = `am start -a android.intent.action.VIEW -d "whatsapp://send?phone=${parsed.details.number}" && input tap ${config.whatsappCoords.x}, ${config.whatsappCoords.y}`;
-  } else if (parsed.intent === 'WHATSAPP_OPEN_CHAT') {
-    commandSummary = `am start -a android.intent.action.VIEW -d "whatsapp://send?phone=${parsed.details.number}"`;
-  } else if (parsed.intent === 'WHATSAPP_TYPE_MESSAGE') {
-    commandSummary = `input text "${parsed.details.message}"`;
-  } else if (parsed.intent === 'WHATSAPP_SEND_MESSAGE') {
-    commandSummary = `input keyevent 66`;
-  } else if (parsed.intent === 'WHATSAPP_AUDIO_CALL') {
-    commandSummary = `input tap [call_button]`;
-  }
-
-  broadcast({ type: 'pipeline_step', step: 3, status: 'success', message: `Script compiled successfully: ${commandSummary}` });
-
-  // Step 5: Execution Engine Action
-  broadcast({ type: 'pipeline_step', step: 4, status: 'pending', message: 'Executing instruction pipeline...' });
-
-  try {
-    let ttsMessage = '';
-    
-    if (parsed.intent === 'SHUTDOWN') {
-      startPcShutdown();
-      ttsMessage = 'Warning! Initiating computer shutdown sequence. You have 10 seconds to abort.';
-    } else if (parsed.intent === 'UNLOCK') {
-      const unlockResult = await unlockPhone(config.unlockPin);
-      if (unlockResult.alreadyUnlocked) {
-        ttsMessage = 'Phone is already unlocked. No action needed.';
-      } else {
-        ttsMessage = 'Phone unlock sequence completed successfully.';
-      }
-    } else if (parsed.intent === 'CALL') {
-      await makeCall(parsed.details.number);
-      ttsMessage = `Calling ${parsed.details.name || 'the number'} now on your device.`;
-    } else if (parsed.intent === 'WHATSAPP') {
-      await sendWhatsAppMessage(parsed.details.number, parsed.details.message, config.whatsappCoords);
-      ttsMessage = `WhatsApp message sent to ${parsed.details.name || 'the contact'}.`;
-    } else if (parsed.intent === 'WHATSAPP_OPEN_CHAT') {
-      if (parsed.details.number) {
-        await openWhatsAppChat(parsed.details.number);
-      } else {
-        await searchAndOpenWhatsAppContact(parsed.details.name);
-      }
-      ttsMessage = `WhatsApp chat opened for ${parsed.details.name}. What would you like to type?`;
-    } else if (parsed.intent === 'WHATSAPP_TYPE_MESSAGE') {
-      await typeText(parsed.details.message);
-      ttsMessage = `Message typed. Say "Vani send message" to send it.`;
-    } else if (parsed.intent === 'WHATSAPP_SEND_MESSAGE') {
-      await tapWhatsAppSend();
-      ttsMessage = `Message sent on WhatsApp!`;
-    } else if (parsed.intent === 'WHATSAPP_ASK_CALL_TYPE') {
-      ttsMessage = `Aap ${parsed.details.name || 'ko'} audio call karna chahte hain ya video call?`;
-    } else if (parsed.intent === 'WHATSAPP_AUDIO_CALL') {
-      if (parsed.details.name) {
-        await searchAndOpenWhatsAppContact(parsed.details.name);
-      }
-      await tapWhatsAppCall();
-      ttsMessage = `Initiating audio call to ${parsed.details.name || 'the contact'}.`;
-    } else if (parsed.intent === 'WHATSAPP_VIDEO_CALL') {
-      if (parsed.details.name) {
-        await searchAndOpenWhatsAppContact(parsed.details.name);
-      }
-      await tapWhatsAppVideoCall();
-      ttsMessage = `Initiating video call to ${parsed.details.name || 'the contact'}.`;
-    } else if (parsed.intent === 'CANCEL') {
-      ttsMessage = `Okay, maine cancel kar diya.`;
-    } else if (parsed.intent === 'VOLUME_UP') {
-      await volumeUp();
-      ttsMessage = 'Volume increased.';
-    } else if (parsed.intent === 'VOLUME_DOWN') {
-      await volumeDown();
-      ttsMessage = 'Volume decreased.';
-    } else if (parsed.intent === 'MUTE') {
-      await volumeMute();
-      ttsMessage = 'Phone muted.';
-    } else if (parsed.intent === 'BRIGHTNESS') {
-      await setBrightness(parsed.details.level);
-      ttsMessage = `Brightness set to ${parsed.details.level > 200 ? 'maximum' : parsed.details.level < 50 ? 'minimum' : 'adjusted level'}.`;
-    } else if (parsed.intent === 'FLASHLIGHT') {
-      await toggleFlashlight(parsed.details.state);
-      ttsMessage = `Flashlight turned ${parsed.details.state ? 'on' : 'off'}.`;
-    } else if (parsed.intent === 'OPEN_APP') {
-      await openApp(parsed.details.appName);
-      ttsMessage = `Opening ${parsed.details.appName} on your phone.`;
-    } else if (parsed.intent === 'OPEN_URL') {
-      await openUrl(parsed.details.url);
-      ttsMessage = `Opening website in browser.`;
-    } else if (parsed.intent === 'WIFI_ON') {
-      await toggleWifi(true);
-      ttsMessage = 'WiFi has been turned on.';
-    } else if (parsed.intent === 'WIFI_OFF') {
-      await toggleWifi(false);
-      ttsMessage = 'WiFi has been turned off.';
-    } else if (parsed.intent === 'BLUETOOTH_ON') {
-      await toggleBluetooth(true);
-      ttsMessage = 'Bluetooth has been enabled.';
-    } else if (parsed.intent === 'BLUETOOTH_OFF') {
-      await toggleBluetooth(false);
-      ttsMessage = 'Bluetooth has been disabled.';
-    } else if (parsed.intent === 'TAKE_PHOTO') {
-      await takePhoto();
-      ttsMessage = 'Photo captured successfully.';
-    } else if (parsed.intent === 'MEDIA_PLAY') {
-      await mediaPlayPause();
-      ttsMessage = 'Media playback toggled.';
-    } else if (parsed.intent === 'MEDIA_NEXT') {
-      await mediaNext();
-      ttsMessage = 'Skipped to next track.';
-    } else if (parsed.intent === 'MEDIA_PREV') {
-      await mediaPrevious();
-      ttsMessage = 'Playing previous track.';
-    } else if (parsed.intent === 'HOME') {
-      await pressHome();
-      ttsMessage = 'Home screen activated.';
-    } else if (parsed.intent === 'BACK') {
-      await pressBack();
-      ttsMessage = 'Navigated back.';
-    } else if (parsed.intent === 'RECENTS') {
-      await openRecents();
-      ttsMessage = 'Recent apps opened.';
-    } else if (parsed.intent === 'NOTIFICATIONS') {
-      await openNotifications();
-      ttsMessage = 'Notification shade opened.';
-    } else if (parsed.intent === 'GOD_MODE') {
-      broadcast({ type: 'pipeline_step', step: 4, status: 'pending', message: 'Executing GOD_MODE rapid override...' });
-      await toggleWifi(true);
-      await setBrightness(255);
-      await toggleFlashlight(true);
-      await openApp('camera');
-      await takePhoto();
-      await mediaPlayPause();
-      ttsMessage = 'God mode sequence executed. System override complete.';
-    }
-
-
-    broadcast({ type: 'pipeline_step', step: 4, status: 'success', message: 'Execution completed. Action transmitted.' });
-    broadcast({ type: 'pipeline_end', success: true, ttsMessage });
-    
-    // Auto-update diagnostics after action
-    setTimeout(async () => {
-      const diagnostics = await getDeviceDiagnostics();
-      broadcast({ type: 'diagnostics', data: diagnostics });
-    }, 4000);
-
-  } catch (error) {
-    broadcast({ type: 'pipeline_step', step: 4, status: 'failed', message: `Execution failed: ${error.message}` });
-    broadcast({ type: 'pipeline_end', success: false, error: error.message, ttsMessage: `Pipeline failed. ${error.message}` });
-  }
-}
-
-/**
- * Initiates 10-second PC Shutdown sequence with abort option
- */
 function startPcShutdown() {
-  cancelPcShutdown(); // Cancel any existing sequence
-  
+  cancelPcShutdown();
+
   shutdownTimeLeft = 10;
   broadcast({ type: 'shutdown_timer_start', seconds: shutdownTimeLeft });
-  
+
   shutdownTimer = setInterval(() => {
     shutdownTimeLeft--;
     broadcast({ type: 'shutdown_timer_tick', seconds: shutdownTimeLeft });
-    
+
     if (shutdownTimeLeft <= 0) {
       clearInterval(shutdownTimer);
       shutdownTimer = null;
       broadcast({ type: 'shutdown_timer_complete' });
-      
-      // Trigger actual OS shutdown
+
       console.log('[SYSTEM] Executing Windows PC Shutdown command...');
       exec('shutdown /s /t 0', (err) => {
         if (err) console.error('Shutdown failed', err);
@@ -545,60 +739,139 @@ function startPcShutdown() {
   }, 1000);
 }
 
-/**
- * Aborts a running PC shutdown sequence
- */
 function cancelPcShutdown() {
   if (shutdownTimer) {
     clearInterval(shutdownTimer);
     shutdownTimer = null;
-    
-    // Trigger abort command just in case standard shutdown timer got scheduled elsewhere
+
     exec('shutdown /a', (err) => {
-      // Ignore errors (usually happens if no shutdown is in progress)
     });
-    
+
     broadcast({ type: 'shutdown_timer_cancelled' });
     console.log('[SYSTEM] PC Shutdown sequence cancelled by user.');
   }
 }
 
-// ==========================================================================
-// Autonomous System Health Poller
-// ==========================================================================
-let lastAlertTime = 0;
-setInterval(async () => {
+async function runMacroByName(name) {
+  const want = String(name || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+  const all = getMacros();
+  const match = all.find((m) => {
+    const n = String(m.name || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+    return n === want || n.includes(want) || want.includes(n);
+  });
+  if (!match) throw new Error(`No macro named "${name}"`);
+  await enqueueMacro(match.id);
+  return { started: match.name };
+}
+
+configurePipeline({ broadcast, startPcShutdown, runMacroByName });
+
+let autoUnlockDeviceId = null;
+let autoUnlockAttempts = 0;
+const AUTO_UNLOCK_MAX_ATTEMPTS = 3;
+
+async function maybeAutoUnlock(diagnostics) {
+  if (!diagnostics || !diagnostics.connected || !diagnostics.deviceId) {
+    autoUnlockDeviceId = null;
+    autoUnlockAttempts = 0;
+    return;
+  }
+  if (diagnostics.deviceId !== autoUnlockDeviceId) {
+    autoUnlockDeviceId = diagnostics.deviceId;
+    autoUnlockAttempts = 0;
+  }
+  if (autoUnlockAttempts >= AUTO_UNLOCK_MAX_ATTEMPTS) return;
+
+  const cfg = readConfig();
+  if (!cfg.autoUnlock || !cfg.unlockPin) return;
+
+  let locked;
   try {
-    const diagnostics = await getDeviceDiagnostics();
+    locked = await isPhoneLocked(diagnostics.deviceId);
+  } catch { return; }
+  if (!locked) {
+    if (autoUnlockAttempts === 0) {
+      broadcast({ type: 'adb_log', log: { type: 'adb-debug', message: '[AUTO-UNLOCK] Device already unlocked - nothing to do.' } });
+    }
+    autoUnlockAttempts = AUTO_UNLOCK_MAX_ATTEMPTS;
+    return;
+  }
+
+  autoUnlockAttempts += 1;
+  broadcast({ type: 'adb_log', log: { type: 'adb-info', message: `[AUTO-UNLOCK] Device locked - unlocking (attempt ${autoUnlockAttempts})...` } });
+  jobs.enqueue(diagnostics.deviceId, async () => {
+    try {
+      await unlockPhone(cfg.unlockPin);
+      invalidateDiagnostics();
+      broadcast({ type: 'adb_log', log: { type: 'adb-success', message: '[AUTO-UNLOCK] Phone unlocked.' } });
+      broadcast({ type: 'system_alert', message: 'Phone auto-unlocked on USB connect.' });
+      autoUnlockAttempts = AUTO_UNLOCK_MAX_ATTEMPTS;
+    } catch (e) {
+      broadcast({ type: 'adb_log', log: { type: 'adb-warning', message: `[AUTO-UNLOCK] Failed: ${e.message}` } });
+    }
+  }, { kind: 'auto_unlock' });
+}
+
+let lastAlertTime = 0;
+const diagnosticsPoll = setInterval(async () => {
+  try {
+    invalidateDiagnostics();
+    const diagnostics = await getDiagnostics();
+    broadcast({ type: 'diagnostics', data: diagnostics });
+
+    maybeAutoUnlock(diagnostics).catch(() => {});
+
     if (diagnostics && diagnostics.connected) {
       const isCritical = diagnostics.batteryLevel <= 15 || (diagnostics.batteryTemp && diagnostics.batteryTemp >= 40);
       const now = Date.now();
-      // Only alert once every 5 minutes maximum
       if (isCritical && (now - lastAlertTime > 5 * 60 * 1000)) {
         lastAlertTime = now;
-        broadcast({ 
-          type: 'system_alert', 
+        broadcast({
+          type: 'system_alert',
           message: 'Warning: Device battery is low or temperature is critical.',
           ttsMessage: 'Warning! Device temperature or battery level is critical. Please check your device.'
         });
       }
     }
   } catch (e) {
-    // Ignore errors for background poller
   }
-}, 30000); // Check every 30 seconds
+}, 5000);
 
-// Boot up
 server.listen(PORT, () => {
   console.log(`\n[SERVER] NexusFlow v7.5 Pro-Max Running at http://localhost:${PORT}`);
   ensureAdbInstalled().catch(console.error);
-  
-  // Automatically open Google Chrome to ensure Web Speech API compatibility
+
+  if (process.env.NEXUSFLOW_NO_BROWSER === '1' || process.platform !== 'win32') return;
   exec(`start chrome http://localhost:${PORT}`, (err) => {
     if (err) {
       console.log('[SERVER] Notice: Could not auto-launch Chrome. Please open it manually if needed.');
     } else {
-      console.log('[SERVER] Successfully auto-launched Google Chrome for Max-Level Voice API support.');
+      console.log('[SERVER] Auto-launched Google Chrome.');
     }
   });
 });
+
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[SERVER] ${signal} received - shutting down gracefully...`);
+  clearInterval(diagnosticsPoll);
+  cancelPcShutdown();
+
+  const deadline = Date.now() + 4000;
+  const finish = () => {
+    for (const ws of wss.clients) { try { ws.close(1001, 'server shutting down'); } catch {  } }
+    server.close(() => { console.log('[SERVER] Closed. Bye.'); process.exit(0); });
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+  const wait = () => {
+    const busy = jobs.list({ states: [JOB_STATES.RUNNING] }).length;
+    if (busy === 0 || Date.now() > deadline) return finish();
+    console.log(`[SERVER] waiting for ${busy} running job(s)...`);
+    setTimeout(wait, 300);
+  };
+  wait();
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
