@@ -1,0 +1,35 @@
+[
+  {
+    "id": "morning-routine",
+    "name": "Morning Routine ☀️",
+    "description": "WiFi ON -> Brightness Max -> Open WhatsApp",
+    "steps": [
+      { "command": "wifi on", "delay": 2000 },
+      { "command": "brightness max", "delay": 1000 },
+      { "command": "open whatsapp", "delay": 2000 }
+    ],
+    "schedule": null
+  },
+  {
+    "id": "night-mode",
+    "name": "Night Mode 🌙",
+    "description": "Brightness Low -> Mute -> WiFi OFF",
+    "steps": [
+      { "command": "brightness low", "delay": 1000 },
+      { "command": "mute", "delay": 1000 },
+      { "command": "wifi off", "delay": 1000 }
+    ],
+    "schedule": null
+  },
+  {
+    "id": "quick-photo",
+    "name": "Quick Photo 📸",
+    "description": "Unlock -> Open Camera -> Take Photo",
+    "steps": [
+      { "command": "unlock phone", "delay": 3000 },
+      { "command": "open camera", "delay": 3000 },
+      { "command": "take photo", "delay": 2000 }
+    ],
+    "schedule": null
+  }
+]
