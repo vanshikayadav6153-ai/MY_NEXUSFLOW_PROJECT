@@ -1,5 +1,21 @@
 node_modules/
 .env
+.env.*
+!.env.example
 .DS_Store
+
+# Runtime data & secrets (never commit)
 server/contacts.json
+server/config.json
+server/macros.json
+server/.runtime/
 server/bin/platform-tools/
+uploads/
+downloads/
+public/screen.png
+public/camera_frame.png
+public/mirror_frame.png
+*.log
+dump_chat.xml
+
+implementation_plan nexus
